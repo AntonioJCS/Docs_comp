@@ -1,0 +1,387 @@
+🧭 Visão consolidada — problema → solução
+
+O cenário parte de uma tabela SoR (System of Record) alimentada por CDC em streaming, modelada como log append-only. Esse modelo é adequado para rastreabilidade e auditoria, mas não para consumo analítico direto no Athena.
+
+O efeito colateral é estrutural:
+
+alta fragmentação física no S3;
+
+grande quantidade de small files;
+
+dados distribuídos de forma não otimizada para leitura seletiva;
+
+aumento do custo de planejamento e execução das queries.
+
+
+Como consequência, consultas simples (ex: buscar um único caso) apresentam latência elevada, não por volume de dados retornados, mas pelo custo de localizar e varrer os arquivos.
+
+A solução não envolve alterar a SoR, mas introduzir uma SoT (System of Truth) otimizada para leitura, baseada em Apache Iceberg, responsável por reorganizar fisicamente os dados e separar ingestão de consumo.
+
+
+---
+
+🧱 Componentes da solução
+
+1. Apache Iceberg — fundação da camada analítica
+
+Problema
+
+S3 armazena apenas arquivos;
+
+ausência de transações e isolamento;
+
+inconsistência potencial em escritas;
+
+alto custo de listagem e leitura de metadados.
+
+
+Solução
+
+O Iceberg adiciona uma camada de abstração que transforma arquivos em uma tabela com comportamento transacional:
+
+ACID (atomicidade e consistência);
+
+isolamento entre leitura e escrita;
+
+versionamento via snapshots;
+
+metadados estruturados para acesso eficiente.
+
+
+Isso permite reprocessamento frequente com segurança e consistência.
+
+
+---
+
+2. Particionamento — redução do escopo de leitura
+
+Problema
+
+ausência de poda eficiente leva a full scan;
+
+leitura de dados irrelevantes.
+
+
+Solução
+
+Particionamento lógico diário (ex: anomesdia):
+
+consultas filtradas por data leem apenas subconjuntos;
+
+redução direta de bytes escaneados;
+
+granularidade adequada para reprocessamento intradiário.
+
+
+No Iceberg, isso ocorre via hidden partitioning, desacoplado de diretórios físicos.
+
+
+---
+
+3. Organização física (Z-Ordering ou ordenação equivalente)
+
+Problema
+
+dentro da partição, registros do mesmo caso estão dispersos;
+
+baixa eficiência de leitura seletiva.
+
+
+Solução
+
+Ordenação física dos dados durante reescrita:
+
+aproxima registros correlacionados;
+
+melhora data skipping (pruning interno);
+
+reduz leitura de blocos irrelevantes.
+
+
+Atua dentro dos arquivos, complementando o particionamento.
+
+
+---
+
+4. Bucketing — distribuição por chave de alta cardinalidade
+
+Problema
+
+Colunas como caso:
+
+possuem alta cardinalidade;
+
+não são adequadas para particionamento;
+
+geram explosão de partições.
+
+
+Solução
+
+Bucketing por caso:
+
+distribuição via hash em número fixo de buckets;
+
+controle de cardinalidade física;
+
+melhora de acesso seletivo;
+
+eficiência em joins e filtros por chave.
+
+
+Combinação ideal:
+
+partição por dia → reduz volume;
+
+bucketing por caso → melhora seletividade.
+
+
+
+---
+
+5. rewrite_data_files — compactação e reorganização
+
+Problema
+
+CDC gera:
+
+milhares de arquivos pequenos;
+
+alto overhead de leitura;
+
+degradação de performance.
+
+
+Solução
+
+Reescrita de arquivos:
+
+consolidação em arquivos maiores (~128MB+);
+
+redução de small files;
+
+reorganização do layout físico;
+
+aplicação de ordenação.
+
+
+Este é o principal mecanismo de ganho de performance.
+
+
+---
+
+6. expire_snapshots — controle de versionamento
+
+Problema
+
+acúmulo de snapshots;
+
+crescimento desnecessário de storage;
+
+potencial impacto indireto.
+
+
+Solução
+
+remoção de snapshots antigos;
+
+eliminação de arquivos órfãos;
+
+retenção apenas do histórico necessário.
+
+
+
+---
+
+7. rewrite_manifests — otimização de metadados
+
+Problema
+
+manifests fragmentados ao longo do tempo;
+
+aumento do tempo de planejamento da query.
+
+
+Solução
+
+reorganização dos manifests;
+
+redução do custo de planejamento;
+
+melhoria no tempo de início das consultas.
+
+
+
+---
+
+🔁 Estratégia operacional
+
+A SoT deve ser alimentada continuamente com foco no dia corrente, respeitando o comportamento append-only do CDC.
+
+Fluxo
+
+1. SoR recebe eventos continuamente (log bruto).
+
+
+2. Processo periódico (batch curto ou micro-batch):
+
+lê eventos do dia corrente;
+
+usa lastmodifieddate como watermark.
+
+
+
+3. SoT (Iceberg) é atualizada:
+
+reescrita da fatia lógica do dia;
+
+consolidação e compactação.
+
+
+
+4. Ao virar o dia:
+
+o dia anterior é considerado estável;
+
+não sofre mais reprocessamento.
+
+
+
+
+
+---
+
+Manutenção periódica
+
+rewrite_data_files → compactação;
+
+rewrite_manifests → metadados;
+
+expire_snapshots → retenção.
+
+
+
+---
+
+🧠 Papel das colunas
+
+anomesdia
+
+função: leitura
+
+uso: particionamento lógico
+
+objetivo: reduzir escopo de scan
+
+
+lastmodifieddate
+
+função: orquestração
+
+uso: watermark incremental
+
+objetivo:
+
+identificar novos eventos;
+
+ordenar mudanças;
+
+suportar reconstrução de estado
+
+
+
+Separação clara:
+
+coluna de acesso → particionamento;
+
+coluna de controle → incremental.
+
+
+
+---
+
+🧾 Arquitetura final
+
+SoR (Raw)
+
+log append-only via CDC;
+
+alta granularidade;
+
+sem otimização para leitura.
+
+
+
+---
+
+SoT 1 — Eventos (Iceberg)
+
+formato Parquet;
+
+particionamento diário;
+
+possível bucketing por caso;
+
+dados compactados e organizados;
+
+reprocessamento do dia corrente;
+
+suporte a análises históricas e auditoria.
+
+
+
+---
+
+SoT 2 — Último Estado
+
+derivada da tabela de eventos;
+
+contém apenas o último registro por chave (caso);
+
+resolve consultas operacionais (lookup rápido);
+
+elimina necessidade de varrer histórico completo.
+
+
+
+---
+
+⚠️ Distinção conceitual crítica
+
+O dia se consolida → válido para eventos
+
+O caso não se consolida → continua evoluindo ao longo do tempo
+
+
+Portanto:
+
+tabela de eventos → organizada por tempo;
+
+tabela de estado → organizada por chave.
+
+
+
+---
+
+✅ Conclusão
+
+O problema não está na query, mas no uso indevido da SoR como fonte analítica.
+
+A solução é introduzir uma camada SoT que:
+
+reorganiza fisicamente os dados;
+
+reduz fragmentação;
+
+separa ingestão de consumo;
+
+materializa estruturas adequadas para cada tipo de consulta.
+
+
+Com isso:
+
+consultas deixam de percorrer arquivos dispersos;
+
+passam a operar sobre dados compactados e organizados;
+
+o tempo de resposta reduz significativamente, especialmente para acessos seletivos.
